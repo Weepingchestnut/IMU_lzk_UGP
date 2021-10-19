@@ -1,3 +1,4 @@
+import math
 import torch
 import torch.nn as nn
 from mmcv.cnn import ConvModule, DepthwiseSeparableConvModule
@@ -45,24 +46,25 @@ class SCConv(nn.Module):
 class SCBottleneck(nn.Module):
     """SCNet SCBottleneck
     """
-    expansion = 4
-    pooling_r = 4 # down-sampling rate of the avg pooling layer in the K3 path of SC-Conv.
+    # expansion = 4
+    # pooling_r = 4 # down-sampling rate of the avg pooling layer in the K3 path of SC-Conv.
 
-    def __init__(self, inplanes, planes, stride=1, downsample=None,
+    def __init__(self, inplanes, planes, pooling_r=4, stride=1, downsample=None,
                  cardinality=1, bottleneck_width=32,
                  avd=False, dilation=1, is_first=False,
                  norm_layer=nn.BatchNorm2d):
         super(SCBottleneck, self).__init__()
         group_width = int(planes * (bottleneck_width / 64.)) * cardinality
+        self.pooling_r = pooling_r
         self.conv1_a = nn.Conv2d(inplanes, group_width, kernel_size=1, bias=False)
         self.bn1_a = norm_layer(group_width)
         self.conv1_b = nn.Conv2d(inplanes, group_width, kernel_size=1, bias=False)
         self.bn1_b = norm_layer(group_width)
-        # self.avd = avd and (stride > 1 or is_first)
-        #
-        # if self.avd:
-        #     self.avd_layer = nn.AvgPool2d(3, stride, padding=1)
-        #     stride = 1
+        self.avd = avd and (stride > 1 or is_first)
+
+        if self.avd:
+            self.avd_layer = nn.AvgPool2d(3, stride, padding=1)
+            stride = 1
 
         self.k1 = nn.Sequential(
                     nn.Conv2d(
@@ -82,7 +84,7 @@ class SCBottleneck(nn.Module):
         # self.bn3 = norm_layer(planes*4)
 
         self.relu = nn.ReLU(inplace=True)
-        # self.downsample = downsample
+        self.downsample = downsample
         self.dilation = dilation
         self.stride = stride
 
@@ -104,9 +106,9 @@ class SCBottleneck(nn.Module):
         out_a = self.relu(out_a)
         out_b = self.relu(out_b)
 
-        # if self.avd:
-        #     out_a = self.avd_layer(out_a)
-        #     out_b = self.avd_layer(out_b)
+        if self.avd:
+            out_a = self.avd_layer(out_a)
+            out_b = self.avd_layer(out_b)
 
         # out = self.conv3(torch.cat([out_a, out_b], dim=1))
         # out = self.bn3(out)
@@ -167,12 +169,12 @@ class DepthwiseSeparableASPPHead(ASPPHead):
             norm_cfg=self.norm_cfg,
             act_cfg=self.act_cfg)
         if c1_in_channels > 0:
-            self.c1_SCConv = SCBottleneck(c1_in_channels, c1_channels)
+            self.c1_SCConv = SCBottleneck(c1_in_channels, c1_channels, 8)
         else:
             self.c1_SCConv = None
-        self.c2_SCConv = SCBottleneck(self.c2_channels, self.c2_channels)
-        self.c3_SCConv = SCBottleneck(self.c3_channels, self.c3_channels)
-        self.c4_SCConv = SCBottleneck(self.c4_channels, self.c4_channels)
+        self.c2_SCConv = SCBottleneck(self.c2_channels, self.c2_channels, 4)
+        self.c3_SCConv = SCBottleneck(self.c3_channels, self.c3_channels, 2)
+        self.c4_SCConv = SCBottleneck(self.c4_channels, self.c4_channels, 1)
 
         self.bottleneck2 = ConvModule(
             self.channels + self.c2_channels,

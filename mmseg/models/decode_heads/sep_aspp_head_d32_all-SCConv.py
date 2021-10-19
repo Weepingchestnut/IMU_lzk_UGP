@@ -46,7 +46,7 @@ class SCBottleneck(nn.Module):
     """SCNet SCBottleneck
     """
     expansion = 4
-    pooling_r = 4 # down-sampling rate of the avg pooling layer in the K3 path of SC-Conv.
+    pooling_r = 2 # down-sampling rate of the avg pooling layer in the K3 path of SC-Conv.
 
     def __init__(self, inplanes, planes, stride=1, downsample=None,
                  cardinality=1, bottleneck_width=32,
@@ -58,11 +58,11 @@ class SCBottleneck(nn.Module):
         self.bn1_a = norm_layer(group_width)
         self.conv1_b = nn.Conv2d(inplanes, group_width, kernel_size=1, bias=False)
         self.bn1_b = norm_layer(group_width)
-        # self.avd = avd and (stride > 1 or is_first)
-        #
-        # if self.avd:
-        #     self.avd_layer = nn.AvgPool2d(3, stride, padding=1)
-        #     stride = 1
+        self.avd = avd and (stride > 1 or is_first)
+
+        if self.avd:
+            self.avd_layer = nn.AvgPool2d(3, stride, padding=1)
+            stride = 1
 
         self.k1 = nn.Sequential(
                     nn.Conv2d(
@@ -82,7 +82,7 @@ class SCBottleneck(nn.Module):
         # self.bn3 = norm_layer(planes*4)
 
         self.relu = nn.ReLU(inplace=True)
-        # self.downsample = downsample
+        self.downsample = downsample
         self.dilation = dilation
         self.stride = stride
 
@@ -104,9 +104,9 @@ class SCBottleneck(nn.Module):
         out_a = self.relu(out_a)
         out_b = self.relu(out_b)
 
-        # if self.avd:
-        #     out_a = self.avd_layer(out_a)
-        #     out_b = self.avd_layer(out_b)
+        if self.avd:
+            out_a = self.avd_layer(out_a)
+            out_b = self.avd_layer(out_b)
 
         # out = self.conv3(torch.cat([out_a, out_b], dim=1))
         # out = self.bn3(out)

@@ -1,3 +1,4 @@
+import math
 import torch
 import torch.nn as nn
 from mmcv.cnn import ConvModule, DepthwiseSeparableConvModule
@@ -6,119 +7,68 @@ from mmseg.ops import resize
 from ..builder import HEADS
 from .aspp_head import ASPPHead, ASPPModule
 
-import torch.nn.functional as F
+from torch.nn import functional as F
 
 
-class SCConv(nn.Module):
-    def __init__(self, inplanes, planes, stride, padding, dilation, groups, pooling_r, norm_layer):
-        super(SCConv, self).__init__()
-        self.k2 = nn.Sequential(
-                    nn.AvgPool2d(kernel_size=pooling_r, stride=pooling_r),
-                    nn.Conv2d(inplanes, planes, kernel_size=3, stride=1,
-                                padding=padding, dilation=dilation,
-                                groups=groups, bias=False),
-                    norm_layer(planes),
-                    )
-        self.k3 = nn.Sequential(
-                    nn.Conv2d(inplanes, planes, kernel_size=3, stride=1,
-                                padding=padding, dilation=dilation,
-                                groups=groups, bias=False),
-                    norm_layer(planes),
-                    )
-        self.k4 = nn.Sequential(
-                    nn.Conv2d(inplanes, planes, kernel_size=3, stride=stride,
-                                padding=padding, dilation=dilation,
-                                groups=groups, bias=False),
-                    norm_layer(planes),
-                    )
+class AttentionGate2D(nn.Module):
+    """attention gate """
+    def __init__(self, x_in_channels, g_in_channels, int_channels, out_channel, conv_cfg, norm_cfg, act_cfg, with_out):
+        super(AttentionGate2D, self).__init__()
+        self.x_c = x_in_channels
+        self.g_c = g_in_channels
+        self.int_c = int_channels
+        self.W_x = ConvModule(
+            in_channels=x_in_channels,      # c4 2048
+            out_channels=int_channels,     # 2048
+            kernel_size=1,
+            conv_cfg=conv_cfg,
+            norm_cfg=norm_cfg,
+            act_cfg=None)
+        self.W_g = ConvModule(
+            in_channels=g_in_channels,      # 512
+            out_channels=int_channels,     # 2048
+            kernel_size=1,
+            conv_cfg=conv_cfg,
+            norm_cfg=norm_cfg,
+            act_cfg=None)
+        self.W_phi = ConvModule(
+            in_channels=int_channels,
+            out_channels=1,
+            kernel_size=1,
+            conv_cfg=conv_cfg,
+            norm_cfg=norm_cfg,
+            act_cfg=None)
+        # if with_out:
+        #     self.out_project = ConvModule(
+        #         in_channels=int_channels,
+        #         out_channels=out_channel,
+        #         kernel_size=1,
+        #         conv_cfg=conv_cfg,
+        #         norm_cfg=norm_cfg,
+        #         act_cfg=act_cfg)
+        # else:
+        #     self.out_project = None
 
-    def forward(self, x):
+    def forward(self, x, g):
+        """
+        @param self:
+        @param x: feature map from encoders
+        @param g: feature map from decoders
+        @return output: attentioned x
+        """
+        # assert x.size(0) == g.size(0)
         identity = x
+        x = self.W_x(x)
+        g = self.W_g(g)
+        theta_1 = F.relu(x + g, inplace=True)
+        theta_2 = torch.sigmoid(self.W_phi(theta_1))
+        # output = theta_2.expand_as(identity) * identity
+        output = theta_2 * identity
 
-        out = torch.sigmoid(torch.add(identity, F.interpolate(self.k2(x), identity.size()[2:]))) # sigmoid(identity + k2)
-        out = torch.mul(self.k3(x), out) # k3 * sigmoid(identity + k2)
-        out = self.k4(out) # k4
+        # if self.out_project is not None:
+        #     output = self.out_project(output)
 
-        return out
-
-
-class SCBottleneck(nn.Module):
-    """SCNet SCBottleneck
-    """
-    expansion = 4
-    pooling_r = 4 # down-sampling rate of the avg pooling layer in the K3 path of SC-Conv.
-
-    def __init__(self, inplanes, planes, stride=1, downsample=None,
-                 cardinality=1, bottleneck_width=32,
-                 avd=False, dilation=1, is_first=False,
-                 norm_layer=nn.BatchNorm2d):
-        super(SCBottleneck, self).__init__()
-        group_width = int(planes * (bottleneck_width / 64.)) * cardinality
-        self.conv1_a = nn.Conv2d(inplanes, group_width, kernel_size=1, bias=False)
-        self.bn1_a = norm_layer(group_width)
-        self.conv1_b = nn.Conv2d(inplanes, group_width, kernel_size=1, bias=False)
-        self.bn1_b = norm_layer(group_width)
-        # self.avd = avd and (stride > 1 or is_first)
-        #
-        # if self.avd:
-        #     self.avd_layer = nn.AvgPool2d(3, stride, padding=1)
-        #     stride = 1
-
-        self.k1 = nn.Sequential(
-                    nn.Conv2d(
-                        group_width, group_width, kernel_size=3, stride=stride,
-                        padding=dilation, dilation=dilation,
-                        groups=cardinality, bias=False),
-                    norm_layer(group_width),
-                    )
-
-        self.scconv = SCConv(
-            group_width, group_width, stride=stride,
-            padding=dilation, dilation=dilation,
-            groups=cardinality, pooling_r=self.pooling_r, norm_layer=norm_layer)
-
-        # self.conv3 = nn.Conv2d(
-        #     group_width * 2, planes * 4, kernel_size=1, bias=False)
-        # self.bn3 = norm_layer(planes*4)
-
-        self.relu = nn.ReLU(inplace=True)
-        # self.downsample = downsample
-        self.dilation = dilation
-        self.stride = stride
-
-    def forward(self, x):
-        # residual = x
-
-        out_a = self.conv1_a(x)
-        # print("out_a: {}".format(out_a.shape))
-        out_a = self.bn1_a(out_a)
-
-        out_b = self.conv1_b(x)
-        out_b = self.bn1_b(out_b)
-
-        out_a = self.relu(out_a)
-        out_b = self.relu(out_b)
-
-        out_a = self.k1(out_a)
-        out_b = self.scconv(out_b)
-        out_a = self.relu(out_a)
-        out_b = self.relu(out_b)
-
-        # if self.avd:
-        #     out_a = self.avd_layer(out_a)
-        #     out_b = self.avd_layer(out_b)
-
-        # out = self.conv3(torch.cat([out_a, out_b], dim=1))
-        # out = self.bn3(out)
-        out = torch.cat([out_a, out_b], dim=1)
-
-        # if self.downsample is not None:
-        #     residual = self.downsample(x)
-        #
-        # out += residual
-        # out = self.relu(out)
-
-        return out
+        return output
 
 
 class DepthwiseSeparableASPPModule(ASPPModule):
@@ -166,13 +116,55 @@ class DepthwiseSeparableASPPHead(ASPPHead):
             conv_cfg=self.conv_cfg,
             norm_cfg=self.norm_cfg,
             act_cfg=self.act_cfg)
+        # if c1_in_channels > 0:
+        #     self.c1_bottleneck = ConvModule(
+        #         c1_in_channels,
+        #         c1_channels,
+        #         1,
+        #         conv_cfg=self.conv_cfg,
+        #         norm_cfg=self.norm_cfg,
+        #         act_cfg=self.act_cfg)
+        # else:
+        #     self.c1_bottleneck = None
         if c1_in_channels > 0:
-            self.c1_SCConv = SCBottleneck(c1_in_channels, c1_channels)
+            self.c1_attention_block = AttentionGate2D(
+                x_in_channels=c1_in_channels,     # 256
+                g_in_channels=self.channels,
+                int_channels=c1_channels//2,       #256
+                out_channel=c1_channels,
+                conv_cfg=self.conv_cfg,
+                norm_cfg=self.norm_cfg,
+                act_cfg=self.act_cfg,
+                with_out=False)
         else:
-            self.c1_SCConv = None
-        self.c2_SCConv = SCBottleneck(self.c2_channels, self.c2_channels)
-        self.c3_SCConv = SCBottleneck(self.c3_channels, self.c3_channels)
-        self.c4_SCConv = SCBottleneck(self.c4_channels, self.c4_channels)
+            self.c1_attention_block = None
+        self.c2_attention_block = AttentionGate2D(
+            x_in_channels=self.c2_channels,
+            g_in_channels=self.channels,
+            int_channels=self.channels//2,
+            out_channel=self.c2_channels,
+            conv_cfg=self.conv_cfg,
+            norm_cfg=self.norm_cfg,
+            act_cfg=self.act_cfg,
+            with_out=False)
+        self.c3_attention_block = AttentionGate2D(
+            x_in_channels=self.c3_channels,
+            g_in_channels=self.channels,
+            int_channels=self.channels//2,
+            out_channel=self.c3_channels,
+            conv_cfg=self.conv_cfg,
+            norm_cfg=self.norm_cfg,
+            act_cfg=self.act_cfg,
+            with_out=False)
+        self.c4_attention_block = AttentionGate2D(
+            x_in_channels=self.c4_channels,
+            g_in_channels=self.channels,
+            int_channels=self.channels//2,
+            out_channel=self.c4_channels,
+            conv_cfg=self.conv_cfg,
+            norm_cfg=self.norm_cfg,
+            act_cfg=self.act_cfg,
+            with_out=False)
 
         self.bottleneck2 = ConvModule(
             self.channels + self.c2_channels,
@@ -230,28 +222,28 @@ class DepthwiseSeparableASPPHead(ASPPHead):
         output = self.bottleneck(aspp_outs)     # 3x3conv channels = 512
         # print("aspp_outs bottleneck: {}".format(output.shape))
         # c4跨层
-        c4_output = self.c4_SCConv(inputs[3])
-        # print("c4_output: ".format(c4_output.shape))
+        c4_output = self.c4_attention_block(inputs[3], output)
+        # print("c4_output: {}".format(c4_output.shape))
         output = torch.cat([output, c4_output], dim=1)      # channels = 2048+512
         output = self.bottleneck4(output)       # 3x3conv channels = 512
         # print("bottleneck4: {}".format(output.shape))
         # c3跨层 2倍上采样
-        c3_output = self.c3_SCConv(inputs[2])
         output = resize(
             input=output,
             size=inputs[2].shape[2:],
             mode='bilinear',
             align_corners=self.align_corners)
+        c3_output = self.c3_attention_block(inputs[2], output)
         output = torch.cat([output, c3_output], dim=1)
         output = self.bottleneck3(output)       # 3x3conv channels = 512
         # print("bottleneck3: {}".format(output.shape))
         # c2跨层 2倍上采样
-        c2_output = self.c2_SCConv(inputs[1])
         output = resize(
             input=output,
             size=inputs[1].shape[2:],
             mode='bilinear',
             align_corners=self.align_corners)
+        c2_output = self.c2_attention_block(inputs[1], output)
         output = torch.cat([output, c2_output], dim=1)
         output = self.bottleneck2(output)       # 3x3conv channels = 512
         # print("bottleneck2: {}".format(output.shape))
@@ -264,13 +256,13 @@ class DepthwiseSeparableASPPHead(ASPPHead):
         #     align_corners=self.align_corners)
         # output = torch.cat([output, inputs[0]], dim=1)
 
-        if self.c1_SCConv is not None:
-            c1_output = self.c1_SCConv(inputs[0])
+        if self.c1_attention_block is not None:
             output = resize(
                 input=output,
                 size=inputs[0].shape[2:],
                 mode='bilinear',
                 align_corners=self.align_corners)
+            c1_output = self.c1_attention_block(inputs[0], output)
             output = torch.cat([output, c1_output], dim=1)
         output = self.sep_bottleneck(output)
         # print("sep_bottleneck: {}".format(output.shape))
