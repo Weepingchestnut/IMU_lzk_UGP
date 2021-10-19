@@ -46,7 +46,7 @@ class SCBottleneck(nn.Module):
     """SCNet SCBottleneck
     """
     expansion = 4
-    pooling_r = 8 # down-sampling rate of the avg pooling layer in the K3 path of SC-Conv.
+    pooling_r = 2 # down-sampling rate of the avg pooling layer in the K3 path of SC-Conv.
 
     def __init__(self, inplanes, planes, stride=1, downsample=None,
                  cardinality=1, bottleneck_width=32,
@@ -58,11 +58,11 @@ class SCBottleneck(nn.Module):
         self.bn1_a = norm_layer(group_width)
         self.conv1_b = nn.Conv2d(inplanes, group_width, kernel_size=1, bias=False)
         self.bn1_b = norm_layer(group_width)
-        # self.avd = avd and (stride > 1 or is_first)
+        self.avd = avd and (stride > 1 or is_first)
 
-        # if self.avd:
-        #     self.avd_layer = nn.AvgPool2d(3, stride, padding=1)
-        #     stride = 1
+        if self.avd:
+            self.avd_layer = nn.AvgPool2d(3, stride, padding=1)
+            stride = 1
 
         self.k1 = nn.Sequential(
                     nn.Conv2d(
@@ -82,7 +82,7 @@ class SCBottleneck(nn.Module):
         # self.bn3 = norm_layer(planes*4)
 
         self.relu = nn.ReLU(inplace=True)
-        # self.downsample = downsample
+        self.downsample = downsample
         self.dilation = dilation
         self.stride = stride
 
@@ -104,9 +104,9 @@ class SCBottleneck(nn.Module):
         out_a = self.relu(out_a)
         out_b = self.relu(out_b)
 
-        # if self.avd:
-        #     out_a = self.avd_layer(out_a)
-        #     out_b = self.avd_layer(out_b)
+        if self.avd:
+            out_a = self.avd_layer(out_a)
+            out_b = self.avd_layer(out_b)
 
         # out = self.conv3(torch.cat([out_a, out_b], dim=1))
         # out = self.bn3(out)
@@ -166,10 +166,10 @@ class DepthwiseSeparableASPPHead(ASPPHead):
             conv_cfg=self.conv_cfg,
             norm_cfg=self.norm_cfg,
             act_cfg=self.act_cfg)
-        # if c1_in_channels > 0:
-        #     self.c1_SCConv = SCBottleneck(c1_in_channels, c1_channels)
-        # else:
-        #     self.c1_SCConv = None
+        if c1_in_channels > 0:
+            self.c1_SCConv = SCBottleneck(c1_in_channels, c1_channels)
+        else:
+            self.c1_SCConv = None
         self.c2_SCConv = SCBottleneck(self.c2_channels, self.c2_channels)
         self.c3_SCConv = SCBottleneck(self.c3_channels, self.c3_channels)
         self.c4_SCConv = SCBottleneck(self.c4_channels, self.c4_channels)
@@ -230,13 +230,18 @@ class DepthwiseSeparableASPPHead(ASPPHead):
         output = self.bottleneck(aspp_outs)     # 3x3conv channels = 512
         # print("aspp_outs bottleneck: {}".format(output.shape))
         # c4跨层
-        # print("c4_output: ".format(c4_output.shape))
         c4_output = self.c4_SCConv(inputs[3])
+        # print("c4_output: ".format(c4_output.shape))
         output = torch.cat([output, c4_output], dim=1)      # channels = 2048+512
         output = self.bottleneck4(output)       # 3x3conv channels = 512
         # print("bottleneck4: {}".format(output.shape))
-        # c3跨层
+        # c3跨层 2倍上采样
         c3_output = self.c3_SCConv(inputs[2])
+        output = resize(
+            input=output,
+            size=inputs[2].shape[2:],
+            mode='bilinear',
+            align_corners=self.align_corners)
         output = torch.cat([output, c3_output], dim=1)
         output = self.bottleneck3(output)       # 3x3conv channels = 512
         # print("bottleneck3: {}".format(output.shape))
@@ -252,21 +257,21 @@ class DepthwiseSeparableASPPHead(ASPPHead):
         # print("bottleneck2: {}".format(output.shape))
 
         # c1跨层 2倍上采样
-        output = resize(
-            input=output,
-            size=inputs[0].shape[2:],
-            mode='bilinear',
-            align_corners=self.align_corners)
-        output = torch.cat([output, inputs[0]], dim=1)
+        # output = resize(
+        #     input=output,
+        #     size=inputs[0].shape[2:],
+        #     mode='bilinear',
+        #     align_corners=self.align_corners)
+        # output = torch.cat([output, inputs[0]], dim=1)
 
-        # if self.c1_SCConv is not None:
-        #     c1_output = self.c1_SCConv(inputs[0])
-        #     output = resize(
-        #         input=output,
-        #         size=inputs[0].shape[2:],
-        #         mode='bilinear',
-        #         align_corners=self.align_corners)
-        #     output = torch.cat([output, c1_output], dim=1)
+        if self.c1_SCConv is not None:
+            c1_output = self.c1_SCConv(inputs[0])
+            output = resize(
+                input=output,
+                size=inputs[0].shape[2:],
+                mode='bilinear',
+                align_corners=self.align_corners)
+            output = torch.cat([output, c1_output], dim=1)
         output = self.sep_bottleneck(output)
         # print("sep_bottleneck: {}".format(output.shape))
         output = self.cls_seg(output)

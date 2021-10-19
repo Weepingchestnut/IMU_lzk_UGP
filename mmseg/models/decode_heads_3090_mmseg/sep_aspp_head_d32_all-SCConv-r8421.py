@@ -7,124 +7,120 @@ from mmseg.ops import resize
 from ..builder import HEADS
 from .aspp_head import ASPPHead, ASPPModule
 
-
-def get_freq_indices(method):
-    assert method in ['top1','top2','top4','top8','top16','top32',
-                      'bot1','bot2','bot4','bot8','bot16','bot32',
-                      'low1','low2','low4','low8','low16','low32']
-    num_freq = int(method[3:])
-    if 'top' in method:
-        all_top_indices_x = [0,0,6,0,0,1,1,4,5,1,3,0,0,0,3,2,4,6,3,5,5,2,6,5,5,3,3,4,2,2,6,1]
-        all_top_indices_y = [0,1,0,5,2,0,2,0,0,6,0,4,6,3,5,2,6,3,3,3,5,1,1,2,4,2,1,1,3,0,5,3]
-        mapper_x = all_top_indices_x[:num_freq]
-        mapper_y = all_top_indices_y[:num_freq]
-    elif 'low' in method:
-        all_low_indices_x = [0,0,1,1,0,2,2,1,2,0,3,4,0,1,3,0,1,2,3,4,5,0,1,2,3,4,5,6,1,2,3,4]
-        all_low_indices_y = [0,1,0,1,2,0,1,2,2,3,0,0,4,3,1,5,4,3,2,1,0,6,5,4,3,2,1,0,6,5,4,3]
-        mapper_x = all_low_indices_x[:num_freq]
-        mapper_y = all_low_indices_y[:num_freq]
-    elif 'bot' in method:
-        all_bot_indices_x = [6,1,3,3,2,4,1,2,4,4,5,1,4,6,2,5,6,1,6,2,2,4,3,3,5,5,6,2,5,5,3,6]
-        all_bot_indices_y = [6,4,4,6,6,3,1,4,4,5,6,5,2,2,5,1,4,3,5,0,3,1,1,2,4,2,1,1,5,3,3,3]
-        mapper_x = all_bot_indices_x[:num_freq]
-        mapper_y = all_bot_indices_y[:num_freq]
-    else:
-        raise NotImplementedError
-    return mapper_x, mapper_y
+import torch.nn.functional as F
 
 
-class MultiSpectralDCTLayer(nn.Module):
-    """
-    Generate dct filters
-    """
-
-    def __init__(self, height, width, mapper_x, mapper_y, channel):
-        super(MultiSpectralDCTLayer, self).__init__()
-
-        assert len(mapper_x) == len(mapper_y)
-        assert channel % len(mapper_x) == 0
-
-        self.num_freq = len(mapper_x)
-
-        # fixed DCT init
-        self.register_buffer('weight', self.get_dct_filter(height, width, mapper_x, mapper_y, channel))
-
-        # fixed random init
-        # self.register_buffer('weight', torch.rand(channel, height, width))
-
-        # learnable DCT init
-        # self.register_parameter('weight', self.get_dct_filter(height, width, mapper_x, mapper_y, channel))
-
-        # learnable random init
-        # self.register_parameter('weight', torch.rand(channel, height, width))
-
-        # num_freq, h, w
+class SCConv(nn.Module):
+    def __init__(self, inplanes, planes, stride, padding, dilation, groups, pooling_r, norm_layer):
+        super(SCConv, self).__init__()
+        self.k2 = nn.Sequential(
+                    nn.AvgPool2d(kernel_size=pooling_r, stride=pooling_r),
+                    nn.Conv2d(inplanes, planes, kernel_size=3, stride=1,
+                                padding=padding, dilation=dilation,
+                                groups=groups, bias=False),
+                    norm_layer(planes),
+                    )
+        self.k3 = nn.Sequential(
+                    nn.Conv2d(inplanes, planes, kernel_size=3, stride=1,
+                                padding=padding, dilation=dilation,
+                                groups=groups, bias=False),
+                    norm_layer(planes),
+                    )
+        self.k4 = nn.Sequential(
+                    nn.Conv2d(inplanes, planes, kernel_size=3, stride=stride,
+                                padding=padding, dilation=dilation,
+                                groups=groups, bias=False),
+                    norm_layer(planes),
+                    )
 
     def forward(self, x):
-        assert len(x.shape) == 4, 'x must been 4 dimensions, but got ' + str(len(x.shape))
-        # n, c, h, w = x.shape
+        identity = x
 
-        x = x * self.weight
+        out = torch.sigmoid(torch.add(identity, F.interpolate(self.k2(x), identity.size()[2:]))) # sigmoid(identity + k2)
+        out = torch.mul(self.k3(x), out) # k3 * sigmoid(identity + k2)
+        out = self.k4(out) # k4
 
-        result = torch.sum(x, dim=[2, 3])
-        return result
-
-    def build_filter(self, pos, freq, POS):
-        result = math.cos(math.pi * freq * (pos + 0.5) / POS) / math.sqrt(POS)
-        if freq == 0:
-            return result
-        else:
-            return result * math.sqrt(2)
-
-    def get_dct_filter(self, tile_size_x, tile_size_y, mapper_x, mapper_y, channel):
-        dct_filter = torch.zeros(channel, tile_size_x, tile_size_y)
-
-        c_part = channel // len(mapper_x)
-
-        for i, (u_x, v_y) in enumerate(zip(mapper_x, mapper_y)):
-            for t_x in range(tile_size_x):
-                for t_y in range(tile_size_y):
-                    dct_filter[i * c_part: (i + 1) * c_part, t_x, t_y] = self.build_filter(t_x, u_x,
-                                                                                           tile_size_x) * self.build_filter(
-                        t_y, v_y, tile_size_y)
-
-        return dct_filter
+        return out
 
 
-class MultiSpectralAttentionLayer(torch.nn.Module):
-    def __init__(self, channel, dct_h, dct_w, reduction=16, freq_sel_method='top2'):
-        super(MultiSpectralAttentionLayer, self).__init__()
-        self.reduction = reduction
-        self.dct_h = dct_h
-        self.dct_w = dct_w
+class SCBottleneck(nn.Module):
+    """SCNet SCBottleneck
+    """
+    # expansion = 4
+    # pooling_r = 4 # down-sampling rate of the avg pooling layer in the K3 path of SC-Conv.
 
-        mapper_x, mapper_y = get_freq_indices(freq_sel_method)
-        self.num_split = len(mapper_x)
-        mapper_x = [temp_x * (dct_h // 7) for temp_x in mapper_x]
-        mapper_y = [temp_y * (dct_w // 7) for temp_y in mapper_y]
-        # make the frequencies in different sizes are identical to a 7x7 frequency space
-        # eg, (2,2) in 14x14 is identical to (1,1) in 7x7
+    def __init__(self, inplanes, planes, pooling_r=4, stride=1, downsample=None,
+                 cardinality=1, bottleneck_width=32,
+                 avd=False, dilation=1, is_first=False,
+                 norm_layer=nn.BatchNorm2d):
+        super(SCBottleneck, self).__init__()
+        group_width = int(planes * (bottleneck_width / 64.)) * cardinality
+        self.pooling_r = pooling_r
+        self.conv1_a = nn.Conv2d(inplanes, group_width, kernel_size=1, bias=False)
+        self.bn1_a = norm_layer(group_width)
+        self.conv1_b = nn.Conv2d(inplanes, group_width, kernel_size=1, bias=False)
+        self.bn1_b = norm_layer(group_width)
+        self.avd = avd and (stride > 1 or is_first)
 
-        self.dct_layer = MultiSpectralDCTLayer(dct_h, dct_w, mapper_x, mapper_y, channel)
-        self.fc = nn.Sequential(
-            nn.Linear(channel, channel // reduction, bias=False),
-            nn.ReLU(inplace=True),
-            nn.Linear(channel // reduction, channel, bias=False),
-            nn.Sigmoid()
-        )
+        if self.avd:
+            self.avd_layer = nn.AvgPool2d(3, stride, padding=1)
+            stride = 1
+
+        self.k1 = nn.Sequential(
+                    nn.Conv2d(
+                        group_width, group_width, kernel_size=3, stride=stride,
+                        padding=dilation, dilation=dilation,
+                        groups=cardinality, bias=False),
+                    norm_layer(group_width),
+                    )
+
+        self.scconv = SCConv(
+            group_width, group_width, stride=stride,
+            padding=dilation, dilation=dilation,
+            groups=cardinality, pooling_r=self.pooling_r, norm_layer=norm_layer)
+
+        # self.conv3 = nn.Conv2d(
+        #     group_width * 2, planes * 4, kernel_size=1, bias=False)
+        # self.bn3 = norm_layer(planes*4)
+
+        self.relu = nn.ReLU(inplace=True)
+        self.downsample = downsample
+        self.dilation = dilation
+        self.stride = stride
 
     def forward(self, x):
-        n,c,h,w = x.shape
-        x_pooled = x
-        if h != self.dct_h or w != self.dct_w:
-            x_pooled = torch.nn.functional.adaptive_avg_pool2d(x, (self.dct_h, self.dct_w))
-            # If you have concerns about one-line-change, don't worry.   :)
-            # In the ImageNet models, this line will never be triggered.
-            # This is for compatibility in instance segmentation and object detection.
-        y = self.dct_layer(x_pooled)
+        # residual = x
 
-        y = self.fc(y).view(n, c, 1, 1)
-        return x * y.expand_as(x)
+        out_a = self.conv1_a(x)
+        # print("out_a: {}".format(out_a.shape))
+        out_a = self.bn1_a(out_a)
+
+        out_b = self.conv1_b(x)
+        out_b = self.bn1_b(out_b)
+
+        out_a = self.relu(out_a)
+        out_b = self.relu(out_b)
+
+        out_a = self.k1(out_a)
+        out_b = self.scconv(out_b)
+        out_a = self.relu(out_a)
+        out_b = self.relu(out_b)
+
+        if self.avd:
+            out_a = self.avd_layer(out_a)
+            out_b = self.avd_layer(out_b)
+
+        # out = self.conv3(torch.cat([out_a, out_b], dim=1))
+        # out = self.bn3(out)
+        out = torch.cat([out_a, out_b], dim=1)
+
+        # if self.downsample is not None:
+        #     residual = self.downsample(x)
+        #
+        # out += residual
+        # out = self.relu(out)
+
+        return out
 
 
 class DepthwiseSeparableASPPModule(ASPPModule):
@@ -173,12 +169,12 @@ class DepthwiseSeparableASPPHead(ASPPHead):
             norm_cfg=self.norm_cfg,
             act_cfg=self.act_cfg)
         if c1_in_channels > 0:
-            self.c1_fca_att = MultiSpectralAttentionLayer(c1_in_channels, 56, 56)
+            self.c1_SCConv = SCBottleneck(c1_in_channels, c1_channels, 8)
         else:
-            self.c1_fca_att = None
-        self.c2_fca_att = MultiSpectralAttentionLayer(self.c2_channels, 28, 28)
-        self.c3_fca_att = MultiSpectralAttentionLayer(self.c3_channels, 14, 14)
-        self.c4_fca_att = MultiSpectralAttentionLayer(self.c4_channels, 7, 7)
+            self.c1_SCConv = None
+        self.c2_SCConv = SCBottleneck(self.c2_channels, self.c2_channels, 4)
+        self.c3_SCConv = SCBottleneck(self.c3_channels, self.c3_channels, 2)
+        self.c4_SCConv = SCBottleneck(self.c4_channels, self.c4_channels, 1)
 
         self.bottleneck2 = ConvModule(
             self.channels + self.c2_channels,
@@ -236,12 +232,13 @@ class DepthwiseSeparableASPPHead(ASPPHead):
         output = self.bottleneck(aspp_outs)     # 3x3conv channels = 512
         # print("aspp_outs bottleneck: {}".format(output.shape))
         # c4跨层
-        c4_output = self.c4_fca_att(inputs[3])
+        c4_output = self.c4_SCConv(inputs[3])
+        # print("c4_output: ".format(c4_output.shape))
         output = torch.cat([output, c4_output], dim=1)      # channels = 2048+512
         output = self.bottleneck4(output)       # 3x3conv channels = 512
         # print("bottleneck4: {}".format(output.shape))
         # c3跨层 2倍上采样
-        c3_output = self.c3_fca_att(inputs[2])
+        c3_output = self.c3_SCConv(inputs[2])
         output = resize(
             input=output,
             size=inputs[2].shape[2:],
@@ -251,7 +248,7 @@ class DepthwiseSeparableASPPHead(ASPPHead):
         output = self.bottleneck3(output)       # 3x3conv channels = 512
         # print("bottleneck3: {}".format(output.shape))
         # c2跨层 2倍上采样
-        c2_output = self.c2_fca_att(inputs[1])
+        c2_output = self.c2_SCConv(inputs[1])
         output = resize(
             input=output,
             size=inputs[1].shape[2:],
@@ -269,11 +266,11 @@ class DepthwiseSeparableASPPHead(ASPPHead):
         #     align_corners=self.align_corners)
         # output = torch.cat([output, inputs[0]], dim=1)
 
-        if self.c1_fca_att is not None:
-            c1_output = self.c1_fca_att(inputs[0])
+        if self.c1_SCConv is not None:
+            c1_output = self.c1_SCConv(inputs[0])
             output = resize(
                 input=output,
-                size=c1_output.shape[2:],
+                size=inputs[0].shape[2:],
                 mode='bilinear',
                 align_corners=self.align_corners)
             output = torch.cat([output, c1_output], dim=1)

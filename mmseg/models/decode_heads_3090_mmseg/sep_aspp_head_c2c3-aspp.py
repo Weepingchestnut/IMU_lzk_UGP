@@ -1,6 +1,6 @@
 import torch
 import torch.nn as nn
-from mmcv.cnn import ConvModule, DepthwiseSeparableConvModule
+from mmcv.cnn import ConvModule, DepthwiseSeparableConvModule, Scale
 
 from mmseg.ops import resize
 from ..builder import HEADS
@@ -52,16 +52,31 @@ class DepthwiseSeparableASPPHead(ASPPHead):
             conv_cfg=self.conv_cfg,
             norm_cfg=self.norm_cfg,
             act_cfg=self.act_cfg)
+
+        self.c3_aspp_modules = DepthwiseSeparableASPPModule(
+            dilations=self.dilations,
+            in_channels=self.c3_channels,
+            channels=self.channels,
+            conv_cfg=self.conv_cfg,
+            norm_cfg=self.norm_cfg,
+            act_cfg=self.act_cfg)
+
+        # self.c2_aspp_modules = DepthwiseSeparableASPPModule(
+        #     dilations=self.dilations,
+        #     in_channels=self.c2_channels,
+        #     channels=self.c2_channels,
+        #     conv_cfg=self.conv_cfg,
+        #     norm_cfg=self.norm_cfg,
+        #     act_cfg=self.act_cfg)
+
         # if c1_in_channels > 0:
-        #     self.c1_bottleneck = ConvModule(
-        #         c1_in_channels,
-        #         c1_channels,
-        #         1,
-        #         conv_cfg=self.conv_cfg,
-        #         norm_cfg=self.norm_cfg,
-        #         act_cfg=self.act_cfg)
+        #     self.c1_CAM = CAM()
         # else:
-        #     self.c1_bottleneck = None
+        #     self.c1_CAM = None
+        # self.c2_CAM = CAM()
+        # self.c3_CAM = CAM()
+        # self.c4_CAM = CAM()
+
         self.bottleneck2 = ConvModule(
             self.channels + self.c2_channels,
             self.channels,
@@ -72,6 +87,7 @@ class DepthwiseSeparableASPPHead(ASPPHead):
             act_cfg=self.act_cfg)
         self.bottleneck3 = ConvModule(
             self.channels + self.c3_channels,
+            # self.channels + self.channels,
             self.channels,
             3,
             padding=1,
@@ -80,6 +96,7 @@ class DepthwiseSeparableASPPHead(ASPPHead):
             act_cfg=self.act_cfg)
         self.bottleneck4 = ConvModule(
             self.channels + self.c4_channels,
+            # self.channels + self.channels,
             self.channels,
             3,
             padding=1,
@@ -105,7 +122,7 @@ class DepthwiseSeparableASPPHead(ASPPHead):
 
     def forward(self, inputs):
         """Forward function."""
-        x = self._transform_inputs(inputs)
+        x = self._transform_inputs(inputs)      # 2048 * 16 * 32
         aspp_outs = [
             resize(
                 self.image_pool(x),
@@ -115,29 +132,41 @@ class DepthwiseSeparableASPPHead(ASPPHead):
         ]
         aspp_outs.extend(self.aspp_modules(x))
         aspp_outs = torch.cat(aspp_outs, dim=1)
-        output = self.bottleneck(aspp_outs)     # 3x3conv channels = 512
+        output = self.bottleneck(aspp_outs)  # 3x3conv channels = 512
         # print("aspp_outs bottleneck: {}".format(output.shape))
         # c4跨层
-        output = torch.cat([output, inputs[3]], dim=1)      # channels = 2048+512
-        output = self.bottleneck4(output)       # 3x3conv channels = 512
+        # print("c4_output: ".format(c4_output.shape))
+        output = torch.cat([output, inputs[3]], dim=1)  # channels = 512+2048
+        output = self.bottleneck4(output)  # 3x3conv channels = 512
         # print("bottleneck4: {}".format(output.shape))
-        # c3跨层 2倍上采样
+        # c3跨层 2倍上采样 d16 + aspp
+        c3_aspp_outs = [
+            resize(
+                self.image_pool(inputs[2]),
+                size=inputs[2].shape[2:],
+                mode='bilinear',
+                align_corners=self.align_corners)
+        ]
+        c3_aspp_outs.extend(self.c3_aspp_modules(inputs[2]))
+        c3_aspp_outs = torch.cat(aspp_outs,dim=1)
+        c3_output = self.bottleneck(c3_aspp_outs)
         output = resize(
             input=output,
             size=inputs[2].shape[2:],
             mode='bilinear',
             align_corners=self.align_corners)
-        output = torch.cat([output, inputs[2]], dim=1)
-        output = self.bottleneck3(output)       # 3x3conv channels = 512
+        output = torch.cat([output, c3_output], dim=1)
+        output = self.bottleneck3(output)  # 3x3conv channels = 512
         # print("bottleneck3: {}".format(output.shape))
-        # c2跨层 2倍上采样
+        # c2跨层 2倍上采样 d8 + aspp
+        # c2_aspp_outs = self.c2_aspp_modules(inputs[1])
         output = resize(
             input=output,
             size=inputs[1].shape[2:],
             mode='bilinear',
             align_corners=self.align_corners)
         output = torch.cat([output, inputs[1]], dim=1)
-        output = self.bottleneck2(output)       # 3x3conv channels = 512
+        output = self.bottleneck2(output)  # 3x3conv channels = 512
         # print("bottleneck2: {}".format(output.shape))
 
         # c1跨层 2倍上采样
@@ -148,14 +177,14 @@ class DepthwiseSeparableASPPHead(ASPPHead):
             align_corners=self.align_corners)
         output = torch.cat([output, inputs[0]], dim=1)
 
-        # if self.c1_bottleneck is not None:
-        #     c1_output = self.c1_bottleneck(inputs[0])
+        # if self.c1_aspp_modules is not None:
+        #     c1_aspp_outs = self.c1_aspp_modules(inputs[0])
         #     output = resize(
         #         input=output,
-        #         size=c1_output.shape[2:],
+        #         size=inputs[0].shape[2:],
         #         mode='bilinear',
         #         align_corners=self.align_corners)
-        #     output = torch.cat([output, c1_output], dim=1)
+        #     output = torch.cat([output, c1_aspp_outs], dim=1)
         output = self.sep_bottleneck(output)
         # print("sep_bottleneck: {}".format(output.shape))
         output = self.cls_seg(output)

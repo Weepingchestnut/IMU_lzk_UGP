@@ -6,26 +6,25 @@ from mmseg.ops import resize
 from ..builder import HEADS
 from .aspp_head import ASPPHead, ASPPModule
 
-from ..utils.se_layer import SELayer
 
+class SELayer(nn.Module):
+    def __init__(self, channel, reduction=16):
+        super(SELayer, self).__init__()
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.fc = nn.Sequential(
+            nn.Linear(channel, channel // reduction, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Linear(channel // reduction, channel, bias=False),
+            nn.Sigmoid()
+        )
 
-# class SELayer(nn.Module):
-#     def __init__(self, channel, reduction=16):
-#         super(SELayer, self).__init__()
-#         self.avg_pool = nn.AdaptiveAvgPool2d(1)
-#         self.fc = nn.Sequential(
-#             nn.Linear(channel, channel // reduction, bias=False),
-#             nn.ReLU(inplace=True),
-#             nn.Linear(channel // reduction, channel, bias=False),
-#             nn.Sigmoid()
-#         )
-#
-#     def forward(self, x):
-#         # print("SELayer is running")
-#         b, c, _, _ = x.size()
-#         y = self.avg_pool(x).view(b, c)
-#         y = self.fc(y).view(b, c, 1, 1)
-#         return x * y.expand_as(x)
+    def forward(self, x):
+        # print("SELayer is running")
+        b, c, _, _ = x.size()
+        y = self.avg_pool(x).view(b, c)
+        y = self.fc(y).view(b, c, 1, 1)
+        return x * y.expand_as(x)
+
 
 class DepthwiseSeparableASPPModule(ASPPModule):
     """Atrous Spatial Pyramid Pooling (ASPP) Module with depthwise separable
@@ -70,12 +69,12 @@ class DepthwiseSeparableASPPHead(ASPPHead):
             norm_cfg=self.norm_cfg,
             act_cfg=self.act_cfg)
         if c1_in_channels > 0:
-            self.c1_seblock = SELayer(c1_in_channels, 16)
+            self.c1_bottleneck = SELayer(c1_in_channels, 16)
         else:
-            self.c1_seblock = None
-        self.c2_seblock = SELayer(512, 16)
-        self.c3_seblock = SELayer(1024, 16)
-        self.c4_seblock = SELayer(2048, 16)
+            self.c1_bottleneck = None
+        self.c2_bottleneck = SELayer(512, 16)
+        self.c3_bottleneck = SELayer(1024, 16)
+        self.c4_bottleneck = SELayer(2048, 16)
 
         self.bottleneck2 = ConvModule(
             self.channels + 512,
@@ -131,27 +130,28 @@ class DepthwiseSeparableASPPHead(ASPPHead):
         aspp_outs.extend(self.aspp_modules(x))
         aspp_outs = torch.cat(aspp_outs, dim=1)
         output = self.bottleneck(aspp_outs)     # 3x3conv channels = 512
-        # print("aspp_outs bottleneck: {}".format(output.shape))
         # c4跨层
-        c4_output = self.c4_seblock(inputs[3])
+        c4_output = self.c4_bottleneck(inputs[3])
         output = torch.cat([output, c4_output], dim=1)      # channels = 2048+512
         output = self.bottleneck4(output)       # 3x3conv channels = 512
-        # print("bottleneck4: {}".format(output.shape))
-        # c3跨层 2倍上采样
-        c3_output = self.c3_seblock(inputs[2])
+        # c3跨层
+        c3_output = self.c3_bottleneck(inputs[2])
+        output = resize(
+            input=output,
+            size=inputs[2].shape[2:],
+            mode='bilinear',
+            align_corners=self.align_corners)
         output = torch.cat([output, c3_output], dim=1)
         output = self.bottleneck3(output)       # 3x3conv channels = 512
-        # print("bottleneck3: {}".format(output.shape))
         # c2跨层 2倍上采样
-        c2_output = self.c2_seblock(inputs[1])
+        c2_output = self.c2_bottleneck(inputs[1])
         output = resize(
             input=output,
             size=inputs[1].shape[2:],
             mode='bilinear',
             align_corners=self.align_corners)
         output = torch.cat([output, c2_output], dim=1)
-        output = self.bottleneck2(output)       # 3x3conv channels = 512
-        # print("bottleneck2: {}".format(output.shape))
+        output = self.bottleneck2(output)
 
         # c1跨层 2倍上采样
         # output = resize(
@@ -161,16 +161,17 @@ class DepthwiseSeparableASPPHead(ASPPHead):
         #     align_corners=self.align_corners)
         # output = torch.cat([output, inputs[0]], dim=1)
 
-        if self.c1_seblock is not None:
-            c1_output = self.c1_seblock(inputs[0])
+        if self.c1_bottleneck is not None:
+            # print("c1_bottleneck is not None")
+            c1_output = self.c1_bottleneck(inputs[0])
+            # print("c1_output: {}".format(c1_output.shape))
             output = resize(
                 input=output,
                 size=c1_output.shape[2:],
                 mode='bilinear',
                 align_corners=self.align_corners)
             output = torch.cat([output, c1_output], dim=1)
+            # print("c1 concat: {}".format(output.shape))
         output = self.sep_bottleneck(output)
-        # print("sep_bottleneck: {}".format(output.shape))
         output = self.cls_seg(output)
-        # print("cls_seg: {}".format(output.shape))
         return output
